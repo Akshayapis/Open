@@ -1,0 +1,238 @@
+/**
+ * U APP build backend + static host.
+ * The GitHub token lives ONLY here (server env). Browsers never receive it.
+ * Endpoints:
+ *   GET  /api/health
+ *   POST /api/build                { id, name, packageId, type, source, version, permissions, ads }
+ *   GET  /api/build/:repo/:run/status
+ *   GET  /api/build/:repo/:run/artifact/:id   -> streams artifact zip
+ */
+import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DIST = process.env.UPLOAD_DIR ? "/app/dist" : path.join(__dirname, "..", "dist");
+const PORT = process.env.PORT || 8080;
+const OWNER = process.env.GITHUB_OWNER || "";
+const TOKEN = process.env.GITHUB_TOKEN || "";
+const WORKFLOW = process.env.GITHUB_WORKFLOW || "android-build.yml";
+const BRANCH = process.env.GITHUB_REF || "main";
+const BUILD_ENABLED = Boolean(OWNER && TOKEN);
+
+const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".ico": "image/x-icon", ".woff2": "font/woff2", ".txt": "text/plain" };
+
+function json(res, status, body) {
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+  res.end(JSON.stringify(body));
+}
+
+async function gh(pathName, init = {}) {
+  const res = await fetch(`https://api.github.com${pathName}`, {
+    ...init,
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${TOKEN}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "uapp-build-service",
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+    },
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text.slice(0, 300) }; }
+  if (!res.ok) {
+    const err = new Error(data?.message || `GitHub API ${res.status}`);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+const slug = (v) => String(v).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 28) || "app";
+const perm = (p) => ({ internet: "INTERNET", network: "ACCESS_NETWORK_STATE", notifications: "POST_NOTIFICATIONS", camera: "CAMERA", microphone: "RECORD_AUDIO", location: "ACCESS_FINE_LOCATION", bluetooth: "BLUETOOTH_CONNECT", nfc: "NFC", media: "READ_MEDIA_IMAGES", contacts: "READ_CONTACTS", calendar: "READ_CALENDAR", vibration: "VIBRATE", wakelock: "WAKE_LOCK", foreground: "FOREGROUND_SERVICE", storage: "READ_EXTERNAL_STORAGE", biometric: "USE_BIOMETRIC" })[p] || String(p).toUpperCase();
+
+const WORKFLOW_YAML = `name: U APP Android build
+on:
+  workflow_dispatch:
+  push: { branches: [ main ] }
+permissions: { contents: read }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v3
+        with: { gradle-version: "8.9" }
+      - run: gradle assembleDebug --no-daemon --stacktrace
+      - run: gradle bundleRelease --no-daemon --stacktrace
+        continue-on-error: true
+      - run: |
+          mkdir -p out
+          find app/build/outputs -type f \\( -name '*.apk' -o -name '*.aab' \\) -exec cp {} out/ \\;
+          cp permission.txt out/ 2>/dev/null || true
+          ls -lh out/
+      - uses: actions/upload-artifact@v4
+        with: { name: uapp-artifact, path: out/, retention-days: 1, if-no-files-found: error }
+`;
+
+function androidProject(app) {
+  const pkgPath = app.packageId.split(".").join("/");
+  const permissions = app.permissions?.length ? app.permissions : ["internet", "network"];
+  const source = String(app.source || "");
+  const isUrl = /^https:\/\//.test(source);
+  const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>${app.name.replace(/[<>]/g, "")}</title><style>html,body{margin:0;height:100%;background:${app.splash || "#080a0d"}}iframe{width:100%;height:100%;border:0;background:#fff;display:block}</style></head><body>${isUrl ? `<iframe src="${source.replace(/"/g, "&quot;")}" allow="camera;microphone;geolocation;fullscreen"></iframe>` : `<div style="color:#fff;font:600 15px system-ui;padding:28px">${app.name}: add your HTML files to app/src/main/assets/www</div>`}</body></html>`;
+  const ads = app.ads ? `{ "network": ${JSON.stringify(app.ads.network || "")}, "app_id_source": "U APP platform managed", "formats": ${JSON.stringify(app.ads.formats || [])}, "timing": ${JSON.stringify(app.ads.timing || "manual")}, "manual_load": true }\n` : "null\n";
+  return {
+    "README.md": `# ${app.name}\n\nGenerated by U APP.\n- Package: \`${app.packageId}\`\n- Version: \`${app.version || "1.0.0"}\`\n- Source: ${source}\n\nPush triggers the included workflow which builds a real APK/AAB.\n`,
+    "settings.gradle": `rootProject.name = "${app.name.replace(/["\\]/g, "")}"\ninclude ':app'\n`,
+    "build.gradle": `buildscript { repositories { google(); mavenCentral() }\n  dependencies { classpath "com.android.tools.build:gradle:8.5.2"; classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24" } }\nallprojects { repositories { google(); mavenCentral() } }\n`,
+    "gradle.properties": `org.gradle.jvmargs=-Xmx2048m\nandroid.useAndroidX=true\n`,
+    "app/build.gradle": `apply plugin: 'com.android.application'\napply plugin: 'org.jetbrains.kotlin.android'\nandroid { namespace "${app.packageId}"\n compileSdk 34\n defaultConfig { applicationId "${app.packageId}"; minSdk 24; targetSdk 34; versionCode 1; versionName "${app.version || "1.0.0"}" }\n compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }\n kotlinOptions { jvmTarget = "17" } }\ndependencies { implementation "androidx.appcompat:appcompat:1.7.0" }\n`,
+    "app/src/main/AndroidManifest.xml": `<?xml version="1.0" encoding="utf-8"?>\n<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n${permissions.map((p) => `  <uses-permission android:name="android.permission.${perm(p)}" />`).join("\n")}\n  <application android:label="${app.name.replace(/"/g, "")}" android:usesCleartextTraffic="false" android:theme="@style/Theme.AppCompat.NoActionBar">\n    <activity android:name=".MainActivity" android:exported="true">\n      <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>\n    </activity>\n  </application>\n</manifest>\n`,
+    "app/src/main/res/values/strings.xml": `<?xml version="1.0" encoding="utf-8"?><resources><string name="app_name">${app.name.replace(/[<&]/g, "")}</string></resources>\n`,
+    [`app/src/main/java/${pkgPath}/MainActivity.kt`]: `package ${app.packageId}\n\nimport android.annotation.SuppressLint\nimport android.os.Bundle\nimport android.webkit.*\nimport androidx.appcompat.app.AppCompatActivity\n\nclass MainActivity : AppCompatActivity() {\n  private lateinit var web: WebView\n  @SuppressLint("SetJavaScriptEnabled")\n  override fun onCreate(b: Bundle?) {\n    super.onCreate(b)\n    web = WebView(this)\n    web.settings.javaScriptEnabled = true\n    web.settings.domStorageEnabled = true\n    web.settings.allowFileAccess = true\n    web.webViewClient = WebViewClient()\n    web.webChromeClient = WebChromeClient()\n    setContentView(web)\n    ${isUrl ? `web.loadUrl("${source.replace(/"/g, '\\"')}")` : `web.loadUrl("file:///android_asset/www/index.html")`}\n  }\n  override fun onBackPressed() { if (this::web.isInitialized && web.canGoBack()) web.goBack() else super.onBackPressed() }\n}\n`,
+    "app/src/main/assets/www/index.html": html,
+    "permission.txt": permissions.map((p) => `android.permission.${perm(p)}`).join("\n") + "\n",
+    "uapp-project.json": JSON.stringify({ ...app, token: undefined, builtAt: new Date().toISOString() }, null, 2),
+    "ads-config.json": ads,
+    ".github/workflows/android-build.yml": WORKFLOW_YAML,
+  };
+}
+
+async function ensureRepo(name) {
+  try {
+    await gh(`/repos/${OWNER}/${name}`);
+    return;
+  } catch (e) {
+    if (e.status !== 404) throw e;
+  }
+  await gh(`/user/repos`, { method: "POST", body: JSON.stringify({ name, private: true, auto_init: true, description: "U APP generated Android project" }) });
+  await new Promise((r) => setTimeout(r, 2000));
+}
+
+async function headSha(repo) {
+  const ref = await gh(`/repos/${OWNER}/${repo}/git/ref/heads/${BRANCH}`);
+  return ref.object.sha;
+}
+
+async function commitFiles(repo, files) {
+  const base = await headSha(repo);
+  const tree = [];
+  for (const [filePath, content] of Object.entries(files)) {
+    if (content === undefined) continue;
+    const blob = await gh(`/repos/${OWNER}/${repo}/git/blobs`, { method: "POST", body: JSON.stringify({ content: String(content), encoding: "utf-8" }) });
+    tree.push({ path: filePath, mode: "100644", type: "blob", sha: blob.sha });
+  }
+  const newTree = await gh(`/repos/${OWNER}/${repo}/git/trees`, { method: "POST", body: JSON.stringify({ base_tree: base, tree }) });
+  const commit = await gh(`/repos/${OWNER}/${repo}/git/commits`, { method: "POST", body: JSON.stringify({ message: "U APP build: project + workflow", tree: newTree.sha, parents: [base] }) });
+  await gh(`/repos/${OWNER}/${repo}/git/refs/heads/${BRANCH}`, { method: "PATCH", body: JSON.stringify({ sha: commit.sha, force: true }) });
+  return commit.sha;
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk;
+      if (raw.length > 2_000_000) { reject(new Error("Payload too large")); req.destroy(); }
+    });
+    req.on("end", () => { try { resolve(raw ? JSON.parse(raw) : {}); } catch { reject(new Error("Invalid JSON")); } });
+    req.on("error", reject);
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url || "/", `http://localhost:${PORT}`);
+
+  if (url.pathname === "/api/health") {
+    return json(res, 200, { ok: true, service: "uapp-build", buildEnabled: BUILD_ENABLED, auth: BUILD_ENABLED ? "server-side" : "not-configured", owner: OWNER || null });
+  }
+
+  if (url.pathname === "/api/build" && req.method === "POST") {
+    if (!BUILD_ENABLED) return json(res, 503, { ok: false, code: "BUILD_NOT_CONFIGURED", message: "Server build service not configured. Installable app packages still work." });
+    try {
+      const app = await readBody(req);
+      if (!app?.id || !app?.name || !/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/.test(app.packageId || "")) return json(res, 400, { ok: false, message: "Invalid app payload." });
+      const repo = `uapp-${slug(app.name)}-${String(app.id).toLowerCase().replace(/[^a-z0-9]/g, "").slice(-6)}`;
+      const steps = [];
+      await ensureRepo(repo);
+      steps.push("repository-ready");
+      const files = androidProject(app);
+      const sha = await commitFiles(repo, files);
+      steps.push(`pushed:${sha.slice(0, 7)}`);
+      let run = null;
+      for (let i = 0; i < 8 && !run; i += 1) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const runs = await gh(`/repos/${OWNER}/${repo}/actions/runs?per_page=5`);
+        run = (runs.workflow_runs || []).find((r) => Date.now() - new Date(r.created_at).getTime() < 180000) || null;
+      }
+      if (!run) {
+        await gh(`/repos/${OWNER}/${repo}/actions/workflows/${encodeURIComponent(WORKFLOW)}/dispatches`, { method: "POST", body: JSON.stringify({ ref: BRANCH }) }).catch(() => null);
+        for (let i = 0; i < 8 && !run; i += 1) {
+          await new Promise((r) => setTimeout(r, 2500));
+          const runs = await gh(`/repos/${OWNER}/${repo}/actions/runs?per_page=5`);
+          run = (runs.workflow_runs || []).find((r) => Date.now() - new Date(r.created_at).getTime() < 180000) || null;
+        }
+      }
+      return json(res, 200, { ok: true, repo, url: `https://github.com/${OWNER}/${repo}`, runId: run?.id ?? null, runUrl: run?.html_url ?? null, steps });
+    } catch (e) {
+      return json(res, 500, { ok: false, code: "BUILD_DISPATCH_FAILED", message: e.message });
+    }
+  }
+
+  const statusMatch = url.pathname.match(/^\/api\/build\/([a-zA-Z0-9._-]+)\/(\d+)\/status$/);
+  if (statusMatch && req.method === "GET") {
+    if (!BUILD_ENABLED) return json(res, 503, { ok: false, message: "Build service not configured." });
+    try {
+      const [, repo, runId] = statusMatch;
+      const run = await gh(`/repos/${OWNER}/${repo}/actions/runs/${runId}`);
+      const artifacts = run.status === "completed" ? await gh(`/repos/${OWNER}/${repo}/actions/runs/${runId}/artifacts`) : { artifacts: [] };
+      return json(res, 200, {
+        ok: true,
+        repo,
+        runId: Number(runId),
+        status: run.status,
+        conclusion: run.conclusion,
+        runUrl: run.html_url,
+        artifacts: (artifacts.artifacts || []).map((a) => ({ id: a.id, name: a.name, size: a.size_in_bytes, expired: a.expired })),
+      });
+    } catch (e) {
+      return json(res, 500, { ok: false, message: e.message });
+    }
+  }
+
+  const artMatch = url.pathname.match(/^\/api\/build\/([a-zA-Z0-9._-]+)\/(\d+)\/artifact\/(\d+)$/);
+  if (artMatch && req.method === "GET") {
+    if (!BUILD_ENABLED) return json(res, 503, { ok: false, message: "Build service not configured." });
+    try {
+      const [, repo, , id] = artMatch;
+      const up = await fetch(`https://api.github.com/repos/${OWNER}/${repo}/actions/artifacts/${id}/zip`, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${TOKEN}`, "User-Agent": "uapp-build-service" } });
+      if (!up.ok) return json(res, up.status, { ok: false, message: "Artifact unavailable or expired." });
+      res.writeHead(200, { "Content-Type": "application/zip", "Content-Disposition": `attachment; filename="uapp-${repo}.zip"`, "Cache-Control": "no-store" });
+      const buf = Buffer.from(await up.arrayBuffer());
+      return res.end(buf);
+    } catch (e) {
+      return json(res, 500, { ok: false, message: e.message });
+    }
+  }
+
+  // static files
+  const safePath = path.normalize(decodeURIComponent(url.pathname)).replace(/^(\.\.[/\\])+/, "");
+  let filePath = path.join(DIST, safePath);
+  if (!filePath.startsWith(DIST)) filePath = path.join(DIST, "index.html");
+  if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) filePath = path.join(DIST, "index.html");
+  const ext = path.extname(filePath);
+  res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream", "X-Content-Type-Options": "nosniff", "Cache-Control": ext === ".html" ? "no-cache" : "public, max-age=31536000, immutable" });
+  fs.createReadStream(filePath).pipe(res);
+});
+
+server.listen(PORT, () => {
+  console.log(`U APP listening on :${PORT} · build service ${BUILD_ENABLED ? "enabled" : "disabled"}`);
+});

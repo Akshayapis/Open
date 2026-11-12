@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: u-app
+    runtime: docker
+    plan: starter
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # Build service (server-side only; browsers never receive this token)
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_OWNER
+        sync: false
+      - key: GITHUB_WORKFLOW
+        value: android-build.yml
+      - key: GITHUB_REF
+        value: main
+      # Optional public developer API base
+      - key: APP_URL
+        sync: false
